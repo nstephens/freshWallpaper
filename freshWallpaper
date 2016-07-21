@@ -1,0 +1,235 @@
+#!/bin/bash 
+## "simple" bash script for getting random wallpapers from various subreddits
+## extensively tested on Ubuntu 14.04.4 LTS with XFCE (ymmv)
+##
+## process flow:
+## grabs a random subreddit from the list in $subredditDir
+## checks if we have a recent (3hrs) json from that subreddit, grabs fresh if not
+## chooses a random image from the json
+## checks to see that the image is not in our history (already have it) or blacklist (hate it)
+## downloads the image and ensures it made it to disk
+## checks the aspect ratio and ensures that it is suitable for a desktop
+## if all of that passes, then it will set the wallpaper on your desktop
+## otherwise, it will loop a number of times before giving up
+##
+## optional arguments [favorite|blacklist]
+## add the current wallpaper to the blacklist (you hate it) - freshWallpaper blacklist
+## add the current wallpaper to your favorites (<3) - freshWallpaper favorite
+##
+## cronjob 
+## designed to automatically discover your XFCE session, so that the script can be automated from
+## cron.  If you are using another WM, this will have to be changed.
+##
+## example:
+## */15 * * * *	/home/nick/bin/freshWallpaper >> /home/nick/.wallpapers/wallpaper.log 2>&1
+
+time=`date +%s`
+today=`date "+%b %_d"`
+freshHours=3
+wallDir="${HOME}/.wallpapers"
+subredditDir="$wallDir/.subreddits"
+userAgent="Mozilla/5.0 (Windows; U; Windows NT 5.1; de; rv:1.9.2.3) Gecko/20100401 Firefox/3.6.3"
+logfile="$wallDir/wallpaper.log"
+metaDict="$wallDir/metaDict.txt"
+blackList="$wallDir/blackList.txt"
+favDir="$wallDir/Favorites"
+errorCount=0
+
+## Get Environmental variable information and ensure needed files/dirs are present
+##
+# Cron won't be able to connect to your XFCE session without this
+pid=`ps -C xfce4-session|grep 'xfce4-session'|awk '{print $1}'`
+#Get the environment variable from /proc
+export $(grep -z DBUS_SESSION_BUS_ADDRESS /proc/$pid/environ)
+
+[[ -d $wallDir ]] || mkdir $wallDir
+[[ -d $favDir ]] || mkdir $favDir
+[[ -d $subredditDir ]] || mkdir $subredditDir
+[[ -f $subredditDir/list ]] || echo -e "wallpapers\nwallpaper\nearthporn\nspaceporn\nauroraporn\nStarshipPorn\nImaginaryStarscapes\njungleporn\neyecandy\nbreathless" > $subredditDir/list
+[[ -f $metaDict ]] || touch $metaDict
+[[ -f $blackList ]] || touch $blackList
+##
+## End environmental setup 
+
+## Begin Functions
+##
+getSubRedditJSON() {
+	if [ -f $subredditDir/$subRed-json ] ; then
+		lastTime=`stat -c %Y $subredditDir/$subRed-json`
+		timeDiff=`echo "($time - $lastTime)/60/60"|bc`
+		if [ $timeDiff -gt $freshHours ] ; then
+			echo "subreddit json is stale, grabbing a fresh one"
+			## old file, grab a fresh copy
+			curl -s -S -A "$userAgent" -o $subredditDir/$subRed-json https://www.reddit.com/r/$subRed/.json
+		fi
+	else
+		## no file found , grab it
+		curl -s -S -A "$userAgent" -o $subredditDir/$subRed-json https://www.reddit.com/r/$subRed/.json
+		echo "subreddit json is missing, grabbing a fresh one"
+	fi
+	echo "subreddit json is present and fresh, using it"
+}
+
+chooseWallpaper() {
+	thisOne=`cat $subredditDir/$subRed-json | python -m json.tool | grep -P '\"url\": \"htt(p|ps):\/\/(i.+)?imgur.com\/(?!.\/)[A-z0-9]{5,7}' | sed -e 's/"url": "//' -e 's/",//' -e 's/gallery\///' -e 's/$/\.jpg/' | shuf -n 1 -|sed -e 's/.jpg.jpg/.jpg/g'`
+	echo "I have chosen: $thisOne"
+	theImage=`echo $thisOne|rev|awk -F/ '{print $1}'|rev`
+}
+
+isFresh() {
+	loopCount=1
+	while true ; do
+		if [ `grep -c $theImage $metaDict` -eq 0 ] && [ `grep -c $theImage $blackList` -eq 0 ] ; then
+			## b00m, we got a new one, we can break this crazy loop
+			echo "Verified fresh image"
+			break
+		fi
+		## we already have this one.. let's try again
+		echo "Wallpaper already found in metaDict or blackList file, trying for another"
+		chooseWallpaper
+		((loopCount++))
+	
+		if [ $loopCount -gt 5 ] ; then
+			echo "Sorry, I tried 5 times, and I couldn't find anything fresh. Let's start over and hope we get a different subreddit"
+			unset thisOne
+			unset theImage
+			((errorCount++))
+			break
+		fi
+	done
+}
+
+checkRatio() {
+	imageChk=$1
+	ratio=`identify $imageChk|awk '{print $3}'`
+	status=`echo $ratio|awk -Fx '{
+		if ($1 < $2)
+			print "bad"
+		else
+			print "good"
+		}'`
+	if [ "$status" == "bad" ] ; then
+		((errorCount++))
+		## not good for wallpaper, so let's rm it and blacklist it
+		rm -f $imageChk
+		echo $theImage >> $blackList
+	fi
+	echo "$imageChk: $status aspect ratio"
+
+}
+
+getCurrentWallpaper() {
+        for i in `xfconf-query -c xfce4-desktop -l | grep "last-image$"`; do
+                currentWallpaper=`xfconf-query -c xfce4-desktop -p $i | sort|uniq`
+        done
+
+	echo "Current wallpaper: $currentWallpaper"
+}
+
+setWallpaper() {
+	for i in `xfconf-query -c xfce4-desktop -l | grep "last-image$"`; do
+		xfconf-query -c xfce4-desktop -p $i -s $wallDir/$theImage
+	done
+
+	if [ $? -eq 0 ] ; then
+		## yay we did it, we did it everyone
+		echo "Success: new wallpaper has been chosen - $theImage - hope you enjoy"
+		exit 0
+	fi
+}
+
+makeFavorite() {
+	getCurrentWallpaper
+	## make sure it still exists
+	if [ -f $currentWallpaper ] ; then
+		mv $currentWallpaper $favDir/
+		echo "Wallpaper has been saved to favorites"
+	else
+		echo "Sorry, that image seems to have disappeared - $currentWallpaper"
+	fi
+
+	exit
+}
+
+blackListImg() {
+	getCurrentWallpaper
+	## make sure it still exists
+	if [ -f $currentWallpaper ] ; then
+		rm -f $currentWallpaper 
+		badImg=`echo $currentWallpaper|rev|awk -F/ '{print $1}'|rev`
+		echo $badImg >> $blackList
+		echo "Wallpaper has been deleted and added to blacklist"
+	else
+		echo "Sorry, that image seems to have disappeared - $currentWallpaper"
+	fi
+}
+mainLoop() {
+	## the heart of the script, when no args are present
+	mainLoopCount=0
+	while true ; do
+		((mainLoopCount++))
+		if [ $mainLoopCount -eq 5 ] ; then
+			echo "Sorry, I tried 5 times, and I couldn't manage to do it.  I have failed you."
+			exit
+		fi
+	
+		## randomly select a subreddit
+		subRed=`shuf -n 1 $subredditDir/list`
+		echo "Subreddit chosen: $subRed"
+	
+		## check for a local copy of the json, fetch a fresh one if needed
+		getSubRedditJSON $subRed
+	
+		## select a random link from the selected json in previous function
+		chooseWallpaper
+	
+		## check if we've downloaded it already
+		isFresh
+	
+		## it's fresh, so let's download the wallpaper
+		curl -s -S --referer "$subredditDir/$subRed" -A "$userAgent" -o $wallDir/$theImage $thisOne
+	
+		## if the file didnt download, then we need to start from the top and pick something new
+		if [ ! -f $wallDir/$theImage ] ; then
+			((errorCount++))
+			echo "Wallpaper not found locally - didn't download"
+			continue
+		fi
+	
+		## check the aspect ratio to make sure it's not for phones etc
+		checkRatio $wallDir/$theImage
+	
+		## add it to the metaDict
+		echo $theImage >> $metaDict
+	
+		## set the wallpaper on your desktop
+		setWallpaper
+		
+		if [ $errorCount -eq 0 ] ; then
+			## everything worked out well
+			exit
+		else
+			echo "Error Count = $errorCount, trying again"
+		fi
+	done
+}
+
+##
+## End Functions
+
+## argv processessing
+##
+case "$1" in
+	favorite)
+		makeFavorite
+		;;
+	blacklist)
+		blackListImg
+		mainLoop
+		;;
+	*) # run as normal
+		mainLoop
+esac
+##
+## End argv processing
+
